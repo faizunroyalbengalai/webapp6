@@ -1,0 +1,237 @@
+---
+- name: Deploy webapp6 on EC2
+  hosts: all
+  become: yes
+
+  vars:
+    app_name: webapp6
+    app_dir: /opt/webapp6
+    app_port: 3000
+    python_version: "3.11"
+    node_version: "18"
+
+  tasks:
+
+    - name: "Update apt cache"
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: "Install system dependencies"
+      apt:
+        name:
+          - curl
+          - git
+          - build-essential
+          - software-properties-common
+          - nginx
+          - python3.11
+          - python3.11-venv
+          - python3.11-dev
+          - python3-pip
+        state: present
+
+    - name: "Install Node.js 18 setup script"
+      shell: |
+        curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+      args:
+        executable: /bin/bash
+
+    - name: "Install Node.js 18"
+      apt:
+        name: nodejs
+        state: present
+        update_cache: yes
+
+    - name: "Install Java 17"
+      apt:
+        name:
+          - openjdk-17-jdk
+        state: present
+
+    - name: "Create app directory"
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0755"
+
+    - name: "Copy application files to remote"
+      synchronize:
+        src: "{{ playbook_dir }}/../"
+        dest: "{{ app_dir }}/"
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=ansible"
+          - "--exclude=terraform"
+          - "--exclude=__pycache__"
+          - "--exclude=*.pyc"
+          - "--exclude=.env"
+
+    - name: "Set ownership of app directory"
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        recurse: yes
+        owner: ubuntu
+        group: ubuntu
+
+    - name: "Write .env file"
+      shell: |
+        printf '' > {{ app_dir }}/.env
+      args:
+        executable: /bin/bash
+
+    - name: "Set .env file ownership"
+      file:
+        path: "{{ app_dir }}/.env"
+        owner: ubuntu
+        group: ubuntu
+        mode: "0600"
+
+    - name: "Check for requirements.txt"
+      stat:
+        path: "{{ app_dir }}/requirements.txt"
+      register: requirements_file
+
+    - name: "Create Python virtual environment"
+      become: yes
+      become_user: ubuntu
+      shell: |
+        python3.11 -m venv {{ app_dir }}/venv
+      args:
+        executable: /bin/bash
+        creates: "{{ app_dir }}/venv"
+
+    - name: "Install Python dependencies"
+      become: yes
+      become_user: ubuntu
+      shell: |
+        {{ app_dir }}/venv/bin/pip install --upgrade pip
+        {{ app_dir }}/venv/bin/pip install -r {{ app_dir }}/requirements.txt
+      args:
+        executable: /bin/bash
+      when: requirements_file.stat.exists
+
+    - name: "Check for package.json"
+      stat:
+        path: "{{ app_dir }}/package.json"
+      register: package_json_file
+
+    - name: "Install Node.js dependencies"
+      become: yes
+      become_user: ubuntu
+      shell: |
+        cd {{ app_dir }} && npm install --production
+      args:
+        executable: /bin/bash
+      when: package_json_file.stat.exists
+
+    - name: "Check for pom.xml"
+      stat:
+        path: "{{ app_dir }}/pom.xml"
+      register: pom_xml_file
+
+    - name: "Install Maven"
+      apt:
+        name: maven
+        state: present
+      when: pom_xml_file.stat.exists
+
+    - name: "Build Maven project"
+      become: yes
+      become_user: ubuntu
+      shell: |
+        cd {{ app_dir }} && mvn clean package -DskipTests
+      args:
+        executable: /bin/bash
+      when: pom_xml_file.stat.exists
+
+    - name: "Create systemd service for webapp6"
+      copy:
+        dest: /etc/systemd/system/webapp6.service
+        content: |
+          [Unit]
+          Description=webapp6 application
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=ubuntu
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ app_dir }}/.env
+          ExecStart={{ app_dir }}/venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port {{ app_port }}
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "Reload systemd daemon"
+      systemd:
+        daemon_reload: yes
+
+    - name: "Enable and start webapp6 service"
+      systemd:
+        name: webapp6
+        enabled: yes
+        state: restarted
+
+    - name: "Configure nginx as reverse proxy"
+      copy:
+        dest: /etc/nginx/sites-available/webapp6
+        content: |
+          server {
+              listen 80;
+              server_name _;
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_cache_bypass $http_upgrade;
+              }
+          }
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "Enable nginx site"
+      file:
+        src: /etc/nginx/sites-available/webapp6
+        dest: /etc/nginx/sites-enabled/webapp6
+        state: link
+
+    - name: "Remove nginx default site"
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: "Test nginx configuration"
+      shell: nginx -t
+      args:
+        executable: /bin/bash
+
+    - name: "Restart nginx"
+      systemd:
+        name: nginx
+        enabled: yes
+        state: restarted
+
+    - name: "Wait for webapp6 to be available"
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ app_port }}"
+        delay: 5
+        timeout: 60
